@@ -1,0 +1,380 @@
+---
+title: "Replication Paper"
+author: "Caya vd Weg"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preamble
+
+```{r installing-packages, message=FALSE, warning=FALSE}
+
+# List of required packages
+packages <- c(
+  "ggpubr", "ggrepel", "kableExtra", "Matching", "paletteer",
+  "plyr", "reshape2", "scales", "stargazer", "Synth",
+  "tidyverse", "WDI", "httr", "readxl", "dplyr", "tidyr"
+)
+
+# Install any that aren't already installed
+installed <- rownames(installed.packages())
+to_install <- setdiff(packages, installed)
+
+if (length(to_install) > 0) {
+  install.packages(to_install)
+}
+
+# Load all packages
+lapply(packages, library, character.only = TRUE)
+
+# Set random seed and global theme
+set.seed(1509)
+theme_set(theme_classic())
+theme_update(axis.line = element_line(color = "grey"))
+
+
+```
+
+## Functions
+
+```{r define-functions}
+# Get ISO country codes from a vector of country IDs
+whodat <- function(id) {
+  country <- NA
+  for (i in 1:length(id)){
+    # Find the unique ISO countrycode where the countryid matches
+    country[i] <- unique(data[which(data$countryid == id[i]), "countrycode"])
+  }
+  return(country)
+}
+
+# Get country names from a vector of ISO countrycodes
+whodis <- function(ISO) {
+  country <- NA
+  for (i in 1:length(ISO)){
+    # Find the unique full country name where the ISO code matches
+    country[i] <- unique(data[which(data$countrycode == ISO[i]), "country"])
+  }
+  return(country)
+}
+
+# Get country names from a vector of country IDs
+whatname <- function(id) {
+  country <- NA
+  for (i in 1:length(id)){
+    # Find the unique country name where the countryid matches
+    country[i] <- unique(data[which(data$countryid == id[i]), "country"])
+  }
+  return(country)
+}
+
+# Get the countryid from a given ISO countrycode
+whichnum <- function(ISO) {
+  num <- data %>%
+    filter(countrycode == ISO) %>%     # Filter rows where ISO code matches
+    distinct(countryid) %>%            # Get distinct countryid(s)
+    pull                               # Extract as vector
+  return(num)
+}
+
+# Return all unique country names in the dataset
+whoder <- function() {
+  unique(data$country)
+}
+```
+
+## Data
+
+```{r import-data}
+
+# Helper function to download and read Excel files from GitHub
+read_excel_github <- function(url, sheet, skip = 0, ext = ".xlsx") {
+  tmp <- tempfile(fileext = ext)
+  response <- GET(url, write_disk(tmp, overwrite = TRUE))
+  read_excel(tmp, sheet = sheet, skip = skip) %>%
+    mutate_all(as.character)
+}
+
+# ----------- Load Codes -----------
+codes_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/Codes_Masterlist.xlsx"
+codes <- read_excel_github(codes_url, sheet = "Codes")
+
+# ----------- Load Climate Policies -----------
+policies_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/Countries%20and%20climate%20policies.xlsx"
+policies <- read_excel_github(policies_url, sheet = "Countries")
+colnames(policies)
+
+# ----------- Load World Bank Analytical Classifications -----------
+wb_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/OGHIST.xls"
+wb_raw <- read_excel_github(wb_url, sheet = "Country Analytical History", skip = 4, ext = ".xls")
+
+WB <- wb_raw %>%
+  slice(-1:-6) %>%
+  select(
+    ISO = 1,
+    Country = 2,
+    FY01 = 15
+  )
+
+# ----------- Missing Data for Germany, Kuwait, and Liechtenstein -----------
+
+# ----- Germany
+# Step 1: Import the file that includes German data
+cdiac_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/nation.1751_2014.csv"
+tmp_csv <- tempfile(fileext = ".csv")
+GET(cdiac_url, write_disk(tmp_csv, overwrite = TRUE))
+
+# Step 2: Read and clean data
+CDIAC <- read_csv(tmp_csv, show_col_types = FALSE) %>%
+  select(
+    Nation = 1,
+    Year = 2,
+    Emissions = 3
+  ) %>%
+  filter(Nation %in% c("FORMER GERMAN DEMOCRATIC REPUBLIC", "FEDERAL REPUBLIC OF GERMANY"))
+
+# Step 3: Reshape and calculate total emissions for unified Germany (missing from the general Rdata file)
+CDIAC_ger <- CDIAC %>%
+  pivot_wider(names_from = Nation, values_from = Emissions) %>%
+  mutate(
+    EN.ATM.CO2E.KT = (`FEDERAL REPUBLIC OF GERMANY` + `FORMER GERMAN DEMOCRATIC REPUBLIC`) * 44 / 12,
+    country = "Germany",
+    iso2c = "DE"
+  ) %>%
+  select(iso2c, country, year = Year, EN.ATM.CO2E.KT) %>%
+  filter(year >= 1960)
+
+# ----- Kuwait
+
+# Step 1: Download WPP Excel file from GitHub
+wpp_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/WPP2019_POP_F01_1_TOTAL_POPULATION_BOTH_SEXES.xlsx"
+wpp_tmp <- tempfile(fileext = ".xlsx")
+GET(wpp_url, write_disk(wpp_tmp, overwrite = TRUE))
+
+# Step 2: Read from row 17 onwards
+WPP_raw <- read_excel(wpp_tmp, sheet = "ESTIMATES", skip = 16, col_names = TRUE) %>%
+  mutate_all(as.character)
+
+# Step 3: Select Kuwait and population columns (AX:AZ → columns 50 to 52)
+WPP <- WPP_raw %>%
+  select(country = 3, `1992` = 50, `1993` = 51, `1994` = 52) %>%
+  filter(country == "Kuwait") %>%
+  pivot_longer(cols = -country, names_to = "year", values_to = "SP.POP.TOTL") %>%
+  mutate(
+    year = as.integer(year),
+    SP.POP.TOTL = as.numeric(SP.POP.TOTL) * 1000,
+    iso2c = "KW"
+  )
+
+# ----------- Import indicators from WDI -----------
+
+# Step 1: Download the RData file
+data_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/data.Rdata"
+tmp_rdata <- tempfile(fileext = ".Rdata")
+GET(data_url, write_disk(tmp_rdata, overwrite = TRUE))
+
+# Step 2: Load it
+load(tmp_rdata)  # This will load a variable called 'data'
+
+# Step 3: Add Germany, Kuwait, and Liechtenstein
+
+# Patch Germany emissions pre-1991
+data <- left_join(data, CDIAC_ger, by = c("country", "year")) %>%
+  mutate(
+    EN.ATM.CO2E.KT = ifelse(country == "Germany" & year <= 1990,
+                             EN.ATM.CO2E.KT.y, EN.ATM.CO2E.KT.x),
+    EN.ATM.CO2E.PC = ifelse(country == "Germany" & year <= 1990,
+                             EN.ATM.CO2E.KT * 1000 / SP.POP.TOTL, EN.ATM.CO2E.PC)
+  ) %>%
+  select(-EN.ATM.CO2E.KT.x, -EN.ATM.CO2E.KT.y)
+
+# Patch Kuwait population 1992–1994
+data[data$country == "Kuwait" & data$year %in% 1992:1994, "SP.POP.TOTL"] <- WPP$SP.POP.TOTL
+data <- data %>%
+  mutate(EN.ATM.CO2E.PC = ifelse(country == "Kuwait" & year %in% 1992:1994, 
+                                 EN.ATM.CO2E.KT * 1000 / SP.POP.TOTL, EN.ATM.CO2E.PC))
+
+# Step 4: Merge
+data <- data %>%
+  rename(iso2c = iso2c.x) %>%
+  select(-iso2c.y)
+
+data <- left_join(data, codes %>%
+                        select(ISO3166.2, ISO3166.3, Country) %>%
+                        distinct(ISO3166.2, .keep_all = TRUE),
+                      by = c("iso2c" = "ISO3166.2")) %>%
+  select(-c(iso2c, country)) %>%
+  rename(
+    countrycode = ISO3166.3,
+    country = Country
+  ) %>%
+  group_by(countrycode) %>%
+  mutate(countryid = cur_group_id()) %>%
+  ungroup() %>%
+  select(countryid, countrycode, country, year, everything()) %>%
+  arrange(countryid)
+```
+
+```{r rescale-emissions}
+# Rescale emissions to 1990 
+data <- data %>%
+  group_by(countryid) %>%
+  mutate(
+    baseline1990 = EN.ATM.CO2E.KT[year == 1990],
+    rescaled1990 = EN.ATM.CO2E.KT / baseline1990
+  ) %>%
+  ungroup()
+attr(data$baseline1990, "label") <- "CO2 emissions (kt) in 1990"
+attr(data$rescaled1990, "label") <- NULL
+
+# Rescale emissions to 2000 
+data <- data %>%
+  group_by(countryid) %>%
+  mutate(
+    baseline2000 = EN.ATM.CO2E.KT[year == 2000],
+    rescaled2000 = EN.ATM.CO2E.KT / baseline2000
+  ) %>%
+  ungroup()
+attr(data$baseline2000, "label") <- "CO2 emissions (kt) in 2000"
+attr(data$rescaled2000, "label") <- NULL
+
+# Emissions per capita demeaned from pre-treatment
+data <- data %>%
+  group_by(countryid) %>%
+  mutate(
+    mean.preT = mean(EN.ATM.CO2E.PC[year >= 1990 & year < 2001], na.rm = TRUE),
+    EN.ATM.CO2E.PC.demean = EN.ATM.CO2E.PC - mean.preT
+  ) %>%
+  ungroup()
+```
+
+```{r drop-missing}
+# POTENTIALLY SIGNIFICANT ADJUSTMENT FROM ORIGINAL PAPER
+# Since we are only matching for pre-treatment from 1990-2000 for Estonia:
+# There is no need to drop countries from the donor pool if they have missing data from 
+# before that time. Therefore, we limit the deletion of countries only from 1990
+# instead 1980 as in the original code.
+# That leaves us now with 14 countries taken out of the data set.
+
+treated <- policies %>%
+  filter("Treated in 2001" == "Yes") %>%
+  select("ISO code") %>%
+  filter("ISO code" != "EST") %>%
+  pull
+
+data <- subset(data, !(countrycode %in% treated))
+whoder()
+
+range(data$year)
+data <- data %>%
+  filter(year >= 1990 & year <= 2005)
+
+nmiss <- ddply(data, "countrycode", summarize,
+               co2.missing = sum(is.na(EN.ATM.CO2E.KT)),
+               co2pc.missing = sum(is.na(EN.ATM.CO2E.PC)),
+               gdppc.missing = sum(is.na(NY.GDP.PCAP.KD)),
+               gdppcgrowth.missing = sum(is.na(NY.GDP.PCAP.KD.ZG)),
+               gdpgrowth.missing = sum(is.na(NY.GDP.MKTP.KD.ZG)),
+               energyimports.missing = sum(is.na(EG.IMP.CONS.ZS)),
+               renewablecons.missing = sum(is.na (EG.FEC.RNEW.ZS)),
+               FFconsumption.missing = sum(is.na(EG.USE.COMM.FO.ZS)),
+               taxrevenuegdp.missing = sum(is.na(GC.TAX.TOTL.GD.ZS)),
+               gdpperenergyu.missing = sum(is.na(EG.GDP.PUSE.KO.PP.KD)),
+               naturresrents.missing = sum(is.na(NY.GDP.TOTL.RT.ZS)),
+               gvtexpendeduc.missing = sum(is.na(SE.XPD.TOTL.GD.ZS)),
+               renewableelec.missing = sum(is.na(EG.ELC.RNEW.ZS)),
+               energyuseinkg.missing = sum(is.na(EG.USE.PCAP.KG.OE)),
+               fuelexportspc.missing = sum(is.na(TX.VAL.FUEL.ZS.UN)),
+               exportsgdp.missing = sum(is.na(NE.EXP.GNFS.ZS)),
+               importsgdp.missing = sum(is.na(NE.IMP.GNFS.ZS)))
+summary(nmiss)
+
+missing <- subset(nmiss,
+                  (co2.missing > 10) | (
+                    co2pc.missing > 10
+                    & gdppc.missing > 10
+                    & gdppcgrowth.missing > 10
+                    & gdpgrowth.missing > 10
+                    & energyimports.missing > 10
+                    & renewablecons.missing > 10
+                    & FFconsumption.missing > 10
+                    & taxrevenuegdp.missing > 10
+                    & gdpperenergyu.missing > 10
+                    & naturresrents.missing > 10
+                    & gvtexpendeduc.missing > 10
+                    & renewableelec.missing > 10
+                    & energyuseinkg.missing > 10
+                    & fuelexportspc.missing > 10
+                    & exportsgdp.missing > 10
+                    & importsgdp.missing > 10)
+)
+
+missing <- missing %>%
+  select(countrycode) %>%
+  pull
+whodis(missing)
+```
+
+```{r add-indicators}
+data <- subset(data, !(countrycode %in% missing))
+whoder()
+
+tinycountries <- data %>%
+  filter(year == 2001) %>%
+  filter(SP.POP.TOTL < 2.5*10^5) %>%
+  distinct(countrycode) %>%
+  pull
+data <- subset(data, !(countrycode %in% tinycountries))
+
+HIC <- codes %>%
+  filter(WB_Income_Group_Code == "HIC") %>%
+  distinct(ISO3166.3) %>%
+  pull
+
+HIC01 <- WB %>%
+  filter(FY01 == "H") %>%
+  distinct(ISO) %>%
+  pull
+
+UMC <- codes %>%
+  filter(WB_Income_Group_Code == "UMC") %>%
+  distinct(ISO3166.3) %>%
+  pull
+
+UMC01 <- WB %>%
+  filter(FY01 == "UM") %>%
+  distinct(ISO) %>%
+  pull
+
+OECD <- codes %>%
+  filter(OECD == 1) %>%
+  distinct(ISO3166.3) %>%
+  pull
+
+OECD01 <- policies %>%
+  filter("OECD (2001)" == "Yes") %>%
+  distinct("ISO code") %>%
+  pull
+
+Commonwealth <- codes %>%
+  filter(Commonwealth == 1) %>%
+  distinct(ISO3166.3) %>%
+  pull
+
+data_all <- data
+```
+
+## Synthetic Control for Estonia
+
+```{r}
+
+head(data %>% filter(countrycode == "EST"))
+colnames(data %>% filter(countrycode == "EST"))
+
+
+
+```
