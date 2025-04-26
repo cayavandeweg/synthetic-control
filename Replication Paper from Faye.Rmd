@@ -1,0 +1,993 @@
+---
+title: "Replication Paper"
+author: "Caya vd Weg, Elena Lopez Hemsing, Faye Crawford"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Intro
+
+## Preamble
+
+```{r installing-packages, message=FALSE, warning=FALSE}
+
+# List of required packages
+packages <- c(
+  "ggpubr", "ggrepel", "kableExtra", "Matching", "paletteer",
+  "plyr", "reshape2", "scales", "stargazer", "Synth",
+  "tidyverse", "WDI", "httr", "readxl", "dplyr", "tidyr"
+)
+
+# Install any that aren't already installed
+installed <- rownames(installed.packages())
+to_install <- setdiff(packages, installed)
+
+if (length(to_install) > 0) {
+  install.packages(to_install)
+}
+
+# Load all packages
+lapply(packages, library, character.only = TRUE)
+
+# Set random seed and global theme
+set.seed(1509)
+theme_set(theme_classic())
+theme_update(axis.line = element_line(color = "grey"))
+
+
+```
+
+## Functions
+
+```{r define-functions}
+# Get ISO country codes from a vector of country IDs
+whodat <- function(id) {
+  country <- NA
+  for (i in 1:length(id)){
+    # Find the unique ISO countrycode where the countryid matches
+    country[i] <- unique(data[which(data$countryid == id[i]), "countrycode"])
+  }
+  return(country)
+}
+
+# Get country names from a vector of ISO countrycodes
+whodis <- function(ISO) {
+  country <- NA
+  for (i in 1:length(ISO)){
+    # Find the unique full country name where the ISO code matches
+    country[i] <- unique(data[which(data$countrycode == ISO[i]), "country"])
+  }
+  return(country)
+}
+
+# Get country names from a vector of country IDs
+whatname <- function(id) {
+  country <- NA
+  for (i in 1:length(id)){
+    # Find the unique country name where the countryid matches
+    country[i] <- unique(data[which(data$countryid == id[i]), "country"])
+  }
+  return(country)
+}
+
+# Get the countryid from a given ISO countrycode
+whichnum <- function(ISO) {
+  num <- data %>%
+    filter(countrycode == ISO) %>%     # Filter rows where ISO code matches
+    distinct(countryid) %>%            # Get distinct countryid(s)
+    pull                               # Extract as vector
+  return(num)
+}
+
+# Return all unique country names in the dataset
+whoder <- function() {
+  unique(data$country)
+}
+```
+
+## Data
+
+```{r import-data}
+# Helper function to download and read Excel files from GitHub
+read_excel_github <- function(url, sheet, skip = 0, ext = ".xlsx") {
+  tmp <- tempfile(fileext = ext)
+  response <- GET(url, write_disk(tmp, overwrite = TRUE))
+  read_excel(tmp, sheet = sheet, skip = skip) %>%
+    mutate_all(as.character)
+}
+
+# ----------- Load Codes -----------
+codes_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/Codes_Masterlist.xlsx"
+codes <- read_excel_github(codes_url, sheet = "Codes")
+
+# ----------- Load Climate Policies -----------
+policies_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/Countries%20and%20climate%20policies.xlsx"
+policies <- read_excel_github(policies_url, sheet = "Countries")
+colnames(policies)
+
+# ----------- Load World Bank Analytical Classifications -----------
+wb_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/OGHIST.xls"
+wb_raw <- read_excel_github(wb_url, sheet = "Country Analytical History", skip = 4, ext = ".xls")
+
+WB <- wb_raw %>%
+  slice(-1:-6) %>%
+  select(
+    ISO = 1,
+    Country = 2,
+    FY01 = 15
+  )
+```
+
+### Adding Missing Data for Germany, Kuwait, and Liechtenstein
+
+```{r import-data}
+
+# ----- Germany
+# Step 1: Import the file that includes German data
+cdiac_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/nation.1751_2014.csv"
+tmp_csv <- tempfile(fileext = ".csv")
+GET(cdiac_url, write_disk(tmp_csv, overwrite = TRUE))
+
+# Step 2: Read and clean data
+CDIAC <- read_csv(tmp_csv, show_col_types = FALSE) %>%
+  select(
+    Nation = 1,
+    Year = 2,
+    Emissions = 3
+  ) %>%
+  filter(Nation %in% c("FORMER GERMAN DEMOCRATIC REPUBLIC", "FEDERAL REPUBLIC OF GERMANY"))
+
+# Step 3: Reshape and calculate total emissions for unified Germany (missing from the general Rdata file)
+CDIAC_ger <- CDIAC %>%
+  pivot_wider(names_from = Nation, values_from = Emissions) %>%
+  mutate(
+    EN.ATM.CO2E.KT = (`FEDERAL REPUBLIC OF GERMANY` + `FORMER GERMAN DEMOCRATIC REPUBLIC`) * 44 / 12,
+    country = "Germany",
+    iso2c = "DE"
+  ) %>%
+  select(iso2c, country, year = Year, EN.ATM.CO2E.KT) %>%
+  filter(year >= 1960)
+
+# ----- Kuwait
+
+# Step 1: Download WPP Excel file from GitHub
+wpp_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/WPP2019_POP_F01_1_TOTAL_POPULATION_BOTH_SEXES.xlsx"
+wpp_tmp <- tempfile(fileext = ".xlsx")
+GET(wpp_url, write_disk(wpp_tmp, overwrite = TRUE))
+
+# Step 2: Read from row 17 onwards
+WPP_raw <- read_excel(wpp_tmp, sheet = "ESTIMATES", skip = 16, col_names = TRUE) %>%
+  mutate_all(as.character)
+
+# Step 3: Select Kuwait and population columns (AX:AZ → columns 50 to 52)
+WPP <- WPP_raw %>%
+  select(country = 3, `1992` = 50, `1993` = 51, `1994` = 52) %>%
+  filter(country == "Kuwait") %>%
+  pivot_longer(cols = -country, names_to = "year", values_to = "SP.POP.TOTL") %>%
+  mutate(
+    year = as.integer(year),
+    SP.POP.TOTL = as.numeric(SP.POP.TOTL) * 1000,
+    iso2c = "KW"
+  )
+
+# ----------- Import indicators from WDI -----------
+
+# Step 1: Download the RData file
+data_url <- "https://raw.githubusercontent.com/cayavandeweg/synthetic-control/main/Data/data.Rdata"
+tmp_rdata <- tempfile(fileext = ".Rdata")
+GET(data_url, write_disk(tmp_rdata, overwrite = TRUE))
+
+# Step 2: Load it
+load(tmp_rdata)  # This will load a variable called 'data'
+
+# Step 3: Add Germany, Kuwait, and Liechtenstein
+
+# Patch Germany emissions pre-1991
+data <- left_join(data, CDIAC_ger, by = c("country", "year")) %>%
+  mutate(
+    EN.ATM.CO2E.KT = ifelse(country == "Germany" & year <= 1990,
+                             EN.ATM.CO2E.KT.y, EN.ATM.CO2E.KT.x),
+    EN.ATM.CO2E.PC = ifelse(country == "Germany" & year <= 1990,
+                             EN.ATM.CO2E.KT * 1000 / SP.POP.TOTL, EN.ATM.CO2E.PC)
+  ) %>%
+  select(-EN.ATM.CO2E.KT.x, -EN.ATM.CO2E.KT.y)
+
+# Patch Kuwait population 1992–1994
+data[data$country == "Kuwait" & data$year %in% 1992:1994, "SP.POP.TOTL"] <- WPP$SP.POP.TOTL
+data <- data %>%
+  mutate(EN.ATM.CO2E.PC = ifelse(country == "Kuwait" & year %in% 1992:1994, 
+                                 EN.ATM.CO2E.KT * 1000 / SP.POP.TOTL, EN.ATM.CO2E.PC))
+
+# Step 4: Merge
+data <- data %>%
+  rename(iso2c = iso2c.x) %>%
+  select(-iso2c.y)
+
+data <- left_join(data, codes %>%
+                        select(ISO3166.2, ISO3166.3, Country) %>%
+                        distinct(ISO3166.2, .keep_all = TRUE),
+                      by = c("iso2c" = "ISO3166.2")) %>%
+  select(-c(iso2c, country)) %>%
+  rename(
+    countrycode = ISO3166.3,
+    country = Country
+  ) %>%
+  group_by(countrycode) %>%
+  mutate(countryid = cur_group_id()) %>%
+  ungroup() %>%
+  select(countryid, countrycode, country, year, everything()) %>%
+  arrange(countryid)
+```
+
+### Dealing with missing data and filtering for countries treated in 2001
+
+```{r}
+# checking for data availability in all years 
+
+library(dplyr)
+
+data %>%
+  filter(year %in% 1990:2000) %>%
+  group_by(year) %>%
+  summarise(
+    total_obs = n(),
+    n_missing = sum(is.na(EN.ATM.CO2E.PC)),
+    pct_missing = n_missing/total_obs*100
+  )
+```
+
+```{r drop-missing}
+# POTENTIALLY SIGNIFICANT ADJUSTMENT FROM ORIGINAL PAPER
+# Since we are only matching for pre-treatment from 1990-2000 for Estonia:
+# There is no need to drop countries from the donor pool if they have missing data from 
+# before that time. Therefore, we limit the deletion of countries only from 1990
+# instead 1980 as in the original code.
+# That leaves us now with 14 countries taken out of the data set.
+
+# Remove countries treated in 2001
+
+treated <- policies %>%
+  filter(`Treated in 2001` == "Yes") %>%
+  filter(`ISO code` != "EST") %>%
+  pull(`ISO code`)
+
+data <- subset(data, !(countrycode %in% treated))
+
+```
+
+```{r}
+# This code cell demonstrates that we successfully removed countries treated in 2001 from the data
+# Get list of treated-in-2001 ISO codes
+treated_2001 <- policies %>%
+  filter(`Treated in 2001` == "Yes") %>%
+  pull(`ISO code`)
+
+# Find overlap with countries still in the dataset
+leftover_treated <- data %>%
+  filter(countrycode %in% treated_2001) %>%
+  select(countrycode, country) %>%
+  distinct()
+
+leftover_treated
+```
+
+```{r}
+# Missing Data
+range(data$year)
+data <- data %>%
+  filter(year >= 1990 & year <= 2005)
+
+nmiss <- ddply(data, "countrycode", summarize,
+               co2.missing = sum(is.na(EN.ATM.CO2E.KT)),
+               co2pc.missing = sum(is.na(EN.ATM.CO2E.PC)),
+               gdppc.missing = sum(is.na(NY.GDP.PCAP.KD)),
+               gdppcgrowth.missing = sum(is.na(NY.GDP.PCAP.KD.ZG)),
+               gdpgrowth.missing = sum(is.na(NY.GDP.MKTP.KD.ZG)),
+               energyimports.missing = sum(is.na(EG.IMP.CONS.ZS)),
+               renewablecons.missing = sum(is.na (EG.FEC.RNEW.ZS)),
+               FFconsumption.missing = sum(is.na(EG.USE.COMM.FO.ZS)),
+               taxrevenuegdp.missing = sum(is.na(GC.TAX.TOTL.GD.ZS)),
+               gdpperenergyu.missing = sum(is.na(EG.GDP.PUSE.KO.PP.KD)),
+               naturresrents.missing = sum(is.na(NY.GDP.TOTL.RT.ZS)),
+               gvtexpendeduc.missing = sum(is.na(SE.XPD.TOTL.GD.ZS)),
+               renewableelec.missing = sum(is.na(EG.ELC.RNEW.ZS)),
+               energyuseinkg.missing = sum(is.na(EG.USE.PCAP.KG.OE)),
+               fuelexportspc.missing = sum(is.na(TX.VAL.FUEL.ZS.UN)),
+               exportsgdp.missing = sum(is.na(NE.EXP.GNFS.ZS)),
+               importsgdp.missing = sum(is.na(NE.IMP.GNFS.ZS)))
+# summary(nmiss)
+
+missing <- subset(nmiss,
+                  (co2.missing > 10) | (
+                    co2pc.missing > 10
+                    & gdppc.missing > 10
+                    & gdppcgrowth.missing > 10
+                    & gdpgrowth.missing > 10
+                    & energyimports.missing > 10
+                    & renewablecons.missing > 10
+                    & FFconsumption.missing > 10
+                    & taxrevenuegdp.missing > 10
+                    & gdpperenergyu.missing > 10
+                    & naturresrents.missing > 10
+                    & gvtexpendeduc.missing > 10
+                    & renewableelec.missing > 10
+                    & energyuseinkg.missing > 10
+                    & fuelexportspc.missing > 10
+                    & exportsgdp.missing > 10
+                    & importsgdp.missing > 10)
+)
+
+missing <- missing %>%
+  select(countrycode) %>%
+  pull
+```
+
+### Adding filters
+
+```{r add-indicators}
+
+data <- subset(data, !(countrycode %in% missing))
+# whoder()
+
+tinycountries <- data %>%
+  filter(year == 2001) %>%
+  filter(SP.POP.TOTL < 2.5*10^5) %>%
+  distinct(countrycode) %>%
+  pull
+data <- subset(data, !(countrycode %in% tinycountries))
+
+HIC <- codes %>%
+  filter(WB_Income_Group_Code == "HIC") %>%
+  distinct(ISO3166.3) %>%
+  pull
+
+HIC01 <- WB %>%
+  filter(FY01 == "H") %>%
+  distinct(ISO) %>%
+  pull
+
+UMC <- codes %>%
+  filter(WB_Income_Group_Code == "UMC") %>%
+  distinct(ISO3166.3) %>%
+  pull
+
+UMC01 <- WB %>%
+  filter(FY01 == "UM") %>%
+  distinct(ISO) %>%
+  pull
+
+OECD <- codes %>%
+  filter(OECD == 1) %>%
+  distinct(ISO3166.3) %>%
+  pull
+
+OECD01 <- policies %>%
+  filter("OECD (2001)" == "Yes") %>%
+  distinct("ISO code") %>%
+  pull
+
+Commonwealth <- codes %>%
+  filter(Commonwealth == 1) %>%
+  distinct(ISO3166.3) %>%
+  pull
+
+```
+
+### Rescaling and demeaning dependent variable
+
+```{r}
+# {rescale-emissions}
+# Rescale emissions to 1992 levels - given that this is the first complete year 
+data <- data %>%
+  group_by(countryid) %>%
+  mutate(
+    baseline1992 = EN.ATM.CO2E.KT[year == 1992],
+    rescaled1992 = EN.ATM.CO2E.KT / baseline1992
+  ) %>%
+  ungroup()
+attr(data$baseline1992, "label") <- "CO2 emissions (kt) in 1992"
+attr(data$rescaled1992, "label") <- NULL
+
+# Rescale emissions to 1999 
+data <- data %>%
+  group_by(countryid) %>%
+  mutate(
+    baseline1999 = EN.ATM.CO2E.KT[year == 1999],
+    rescaled1999 = EN.ATM.CO2E.KT / baseline1999
+  ) %>%
+  ungroup()
+attr(data$baseline1999, "label") <- "CO2 emissions (kt) in 1999"
+attr(data$rescaled1999, "label") <- NULL
+
+```
+
+```{r}
+# Emissions per capita demeaned from pre-treatment
+data <- data %>%
+  group_by(countryid) %>%
+  mutate(
+    mean.preT = mean(EN.ATM.CO2E.PC[year >= 1992 & year < 2000], na.rm = TRUE),
+    EN.ATM.CO2E.PC.demean = EN.ATM.CO2E.PC - mean.preT
+  ) %>%
+  ungroup()
+```
+
+# Synthetic Control for Estonia
+
+## Preparation
+
+```{r}
+# 0) Prep: load libraries & data
+library(dplyr)
+library(Synth)
+library(ggplot2)
+
+# If you ever did a group_by(), first drop grouping
+if ("grouped_df" %in% class(data)) {
+  data <- dplyr::ungroup(data)
+}
+
+# Now coerce to a base data.frame
+data <- as.data.frame(data)
+
+# Check
+class(data)
+# [1] "data.frame"
+
+
+# 1) Identify Estonia and donor pool
+treated.unit  <- data %>% filter(countrycode == "EST") %>% pull(countryid) %>% unique()
+control.units <- setdiff(unique(data$countryid), treated.unit)
+
+# 2) Define pre-treatment window and full plot window
+pre_years <- 1992:2000
+plot_years <- 1992:2005
+
+# ---- A) Synthetic Control on 1992-indexed series ----
+dp_res <- dataprep(
+  foo                   = data,
+  predictors            = NULL,
+  predictors.op         = NULL,
+  special.predictors    = list(
+               list("EN.ATM.CO2E.PC", 1992, "mean"),
+               list("EN.ATM.CO2E.PC", 1993, "mean"),
+               list("EN.ATM.CO2E.PC", 1994, "mean"),
+               list("EN.ATM.CO2E.PC", 1995, "mean"),
+               list("EN.ATM.CO2E.PC", 1996, "mean"),
+               list("EN.ATM.CO2E.PC", 1997, "mean"),
+               list("EN.ATM.CO2E.PC", 1998, "mean"),
+               list("EN.ATM.CO2E.PC", 1999, "mean")),
+  dependent             = "EN.ATM.CO2E.PC",
+  unit.variable         = "countryid",
+  unit.names.variable   = "country",
+  time.variable         = "year",
+  treatment.identifier  = treated.unit,
+  controls.identifier   = control.units,
+  time.predictors.prior = pre_years,
+  time.optimize.ssr     = pre_years,
+  time.plot             = plot_years
+)
+
+synth_res <- synth(dp_res)
+```
+
+```{r}
+print(length(control.units))
+```
+
+## Plot
+
+```{r}
+# 1) Path plot with a treatment‐year line
+path.plot(
+  dataprep.res    = dp_res,
+  synth.res       = synth_res,
+  Ylab            = "CO2 emissions per capita",
+  Xlab            = "Year",
+  Legend          = c("Estonia", "Synthetic Estonia"),
+  Legend.position = "topright"
+)
+abline(v = 2000, lty = 2, col = "red", lwd = 2)   # add dashed red v-line at 2001
+
+# 2) Gap plot with the same treatment‐year marker
+gaps.plot(
+  dataprep.res = dp_res,
+  synth.res    = synth_res,
+  Ylab         = "Gap in emissions index",
+  Xlab         = "Year"
+)
+abline(v = 2000, lty = 2, col = "red", lwd = 2)   # add dashed red v-line at 2001
+```
+
+## Tables and gaps
+
+```{r}
+## Tabulate results
+synth.tables <- synth.tab(dataprep.res = dp_res, synth.res = synth_res)
+
+# Pre-treatment predictor balance
+synth.tables$tab.pred
+
+# V-weights on predictors
+synth.tables$tab.v
+
+# W-weights on donor countries
+synth.tables$tab.w %>%
+  filter(w.weights > 0.01)
+```
+
+```{r}
+# Get the gaps (treated - synthetic) from Synth
+gaps <- dp_res$Y1plot - (dp_res$Y0plot %*% synth_res$solution.w)
+
+# Compute pre-treatment MSPE
+pre_treatment_years <- which(dp_res$tag$time.plot %in% pre_years)
+mspe_pre <- mean((gaps[pre_treatment_years])^2)
+
+mspe_pre
+
+# Create the table for post-treatment years
+gap_table <- data.frame(
+  Year = years_post,
+  Gap = round(gaps[dp_res$tag$time.plot %in% years_post], 3)
+)
+
+# View the table
+print(gap_table, row.names = FALSE)
+```
+
+# In-time Placebo Test
+
+```{r}
+library(Synth)
+library(dplyr)
+
+#── In-time placebo function ───────────────────────────────────────────────────
+run_in_time_placebo <- function(placebo_year) {
+  # Use everything before the placebo_year as "pre"
+  yrs_pred <- min(pre_years):(placebo_year - 1)
+  
+  dp_pl <- dataprep(
+    foo                   = data,
+    predictors            = NULL,
+    predictors.op         = NULL,
+    special.predictors    = list(
+      # mean of the dependent in each year of the fake pre-period
+      list("EN.ATM.CO2E.PC", yrs_pred, "mean")
+    ),
+    dependent             = "EN.ATM.CO2E.PC",
+    unit.variable         = "countryid",
+    unit.names.variable   = "country",
+    time.variable         = "year",
+    treatment.identifier  = treated.unit,
+    controls.identifier   = control.units,
+    time.predictors.prior = yrs_pred,
+    time.optimize.ssr     = yrs_pred,
+    time.plot             = plot_years
+  )
+  
+  synth_pl <- synth(dp_pl)
+
+  
+  
+  # Plot actual vs synthetic around the placebo cut
+  path.plot(
+    dataprep.res    = dp_pl,
+    synth.res       = synth_pl,
+    Xlab            = "Year",
+    Ylab            = expression("CO2 per capita (kt)"),
+    Legend          = c("Estonia", "Synthetic Estonia"),
+    Legend.position = "topright"
+  )
+  
+  # Add vertical lines at the placebo and actual treatment year
+  abline(v = placebo_year, lty = 2, col = "blue", lwd = 2)
+  abline(v = 2000, lty = 2, col = "darkred", lwd = 2)
+  title(main = paste("In-Time Placebo at", placebo_year))
+}
+
+# Example: run placebo at 1999
+run_in_time_placebo(1999)
+```
+
+# In-space Placebo Test
+
+```{r}
+# 1) For each “treated” country (Estonia + each donor), fit a synth and extract the gap
+all_gaps <- lapply(
+  X = c(treated.unit, control.units),
+  FUN = function(tr) {
+    # other units to serve as controls
+    ctrls <- setdiff(c(treated.unit, control.units), tr)
+
+    # prepare and fit
+    dp <- dataprep(
+      foo                   = data,
+      predictors            = NULL,
+      predictors.op         = NULL,
+      special.predictors    = list(
+        list("EN.ATM.CO2E.PC", pre_years, "mean")
+      ),
+      dependent             = "EN.ATM.CO2E.PC",
+      unit.variable         = "countryid",
+      unit.names.variable   = "country",
+      time.variable         = "year",
+      treatment.identifier  = tr,
+      controls.identifier   = ctrls,
+      time.predictors.prior = pre_years,
+      time.optimize.ssr     = pre_years,
+      time.plot             = plot_years
+    )
+    sr <- synth(dp)
+
+    # compute the gap series
+    gap <- dp$Y1plot - dp$Y0plot %*% sr$solution.w
+    
+     # Compute MSPE over pre-treatment years
+    pre_idx <- dp$tag$time.plot %in% pre_years
+    mspe <- mean((dp$Y1plot[pre_idx] - (dp$Y0plot[pre_idx, ] %*% sr$solution.w))^2)
+
+    # return a tidy data.frame
+    data.frame(
+      year    = plot_years,
+      gap     = as.numeric(gap),
+      treated = ifelse(tr == treated.unit, "Estonia", paste0("Unit_", tr)),
+      mspe=mspe,
+      stringsAsFactors = FALSE
+    )
+  }
+)
+
+all_gaps_df <- bind_rows(all_gaps)
+```
+
+```{r}
+# 2) Make the placebo plot
+p_placebo <- ggplot(all_gaps_df, aes(x = year, y = gap, group = treated)) +
+  # all donors in light grey
+  geom_line(
+    data = filter(all_gaps_df, treated != "Estonia"),
+    color = "grey80", size = 0.4
+  ) +
+  # Estonia in bold black
+  geom_line(
+    data = filter(all_gaps_df, treated == "Estonia"),
+    color = "black", size = 1.2
+  ) +
+  # vertical line at the treatment year
+  geom_vline(xintercept = 2000, linetype = "dashed") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Placebo Synthetic-Control Gaps: Estonia vs. Donors",
+    x     = "Year",
+    y     = expression("Gap in CO"[2]*" pc (kt)")
+  )
+
+print(p_placebo)
+
+```
+
+```{r}
+# --- Filter for placebos with reasonable pre-treatment MSPE ---
+
+# 1. Calculate Estonia’s MSPE (only need one value)
+estonia_mspe <- all_gaps_df %>%
+  filter(treated == "Estonia") %>%
+  distinct(mspe) %>%
+  pull()
+
+# 2. Filter out control units with MSPE > 3× Estonia's
+filtered_gaps_3 <- all_gaps_df %>%
+  filter(mspe <= 3 * estonia_mspe)
+
+# 3. Plot filtered placebo gaps
+p_placebo_filtered <- ggplot(filtered_gaps_3, aes(x = year, y = gap, group = treated)) +
+  # donors with acceptable MSPE
+  geom_line(
+    data = filter(filtered_gaps_3, treated != "Estonia"),
+    color = "grey70", size = 0.4
+  ) +
+  # Estonia in black
+  geom_line(
+    data = filter(filtered_gaps_3, treated == "Estonia"),
+    color = "black", size = 1.2
+  ) +
+  geom_vline(xintercept = 2000, linetype = "dashed") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Filtered Placebo Plot (MSPE ≤ 3× Estonia’s)",
+    x     = "Year",
+    y     = expression("Gap in CO2 emissions")
+  )
+
+# Print filtered plot
+print(p_placebo_filtered)
+
+```
+
+```{r}
+# 2. Filter out control units with MSPE > 2× Estonia's
+filtered_gaps_2 <- all_gaps_df %>%
+  filter(mspe <= 2 * estonia_mspe)
+
+# 3. Plot filtered placebo gaps
+p_placebo_filtered <- ggplot(filtered_gaps_2, aes(x = year, y = gap, group = treated)) +
+  # donors with acceptable MSPE
+  geom_line(
+    data = filter(filtered_gaps_2, treated != "Estonia"),
+    color = "grey70", size = 0.4
+  ) +
+  # Estonia in black
+  geom_line(
+    data = filter(filtered_gaps_2, treated == "Estonia"),
+    color = "black", size = 1.2
+  ) +
+  geom_vline(xintercept = 2000, linetype = "dashed") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Filtered Placebo Plot (MSPE ≤ 2× Estonia’s)",
+    x     = "Year",
+    y     = expression("Gap in CO2 emissions")
+  )
+
+# Print filtered plot
+print(p_placebo_filtered)
+```
+
+```{r}
+# 2. Filter out control units with MSPE > 1.5× Estonia's
+filtered_gaps_1.5 <- all_gaps_df %>%
+  filter(mspe <= 1.5 * estonia_mspe)
+
+# 3. Plot filtered placebo gaps
+ggplot(filtered_gaps_1.5, aes(x = year, y = gap, group = treated)) +
+  # donors with acceptable MSPE
+  geom_line(
+    data = filter(filtered_gaps_1.5, treated != "Estonia"),
+    color = "grey70", size = 0.4
+  ) +
+  # Estonia in black
+  geom_line(
+    data = filter(filtered_gaps_1.5, treated == "Estonia"),
+    color = "black", size = 1.2
+  ) +
+  geom_vline(xintercept = 2000, linetype = "dashed") +
+  theme_minimal(base_size = 14) +
+  coord_cartesian(ylim = c(-3, 8)) + 
+  labs(
+    x     = "Year",
+    y     = expression("Gap in per capita CO2 emissions (kt)")
+  )
+
+```
+
+# Alternative specification
+
+```{r}
+# 0) Prep: load libraries & data
+library(dplyr)
+library(Synth)
+library(ggplot2)
+
+# If you ever did a group_by(), first drop grouping
+if ("grouped_df" %in% class(data)) {
+  data <- dplyr::ungroup(data)
+}
+
+# Now coerce to a base data.frame
+data <- as.data.frame(data)
+
+# Check
+class(data)
+# [1] "data.frame"
+
+# 1) Identify Estonia and donor pool
+treated.unit  <- data %>% filter(countrycode == "EST") %>% pull(countryid) %>% unique()
+control.units <- setdiff(unique(data$countryid), treated.unit)
+
+# 2) Define pre-treatment window and full plot window
+pre_years <- 1992:2000
+plot_years <- 1992:2005
+
+# ---- B) Synthetic Control on rescaled1992 ----
+dp_rescaled <- dataprep(
+  foo                   = data,
+  predictors            = NULL,
+  predictors.op         = NULL,
+  special.predictors    = list(
+               list("rescaled1992", 1993, "mean"), # 1992 removed because it has no variation, gives a bug
+               list("rescaled1992", 1994, "mean"),
+               list("rescaled1992", 1995, "mean"),
+               list("rescaled1992", 1996, "mean"),
+               list("rescaled1992", 1997, "mean"),
+               list("rescaled1992", 1998, "mean"),
+               list("rescaled1992", 1999, "mean")),
+  dependent             = "rescaled1992",
+  unit.variable         = "countryid",
+  unit.names.variable   = "country",
+  time.variable         = "year",
+  treatment.identifier  = treated.unit,
+  controls.identifier   = control.units,
+  time.predictors.prior = pre_years,
+  time.optimize.ssr     = pre_years,
+  time.plot             = plot_years
+)
+
+synth_rescaled <- synth(dp_rescaled)
+```
+
+```{r}
+# 1) Path plot with a treatment-year line
+path.plot(
+  dataprep.res    = dp_rescaled,
+  synth.res       = synth_rescaled,
+  Ylab            = "CO2 emissions per capita (rescaled to 1992 = 100)",
+  Xlab            = "Year",
+  Legend          = c("Estonia", "Synthetic Estonia"),
+  Legend.position = "topright"
+)
+abline(v = 2000, lty = 2, col = "red", lwd = 2)   # dashed red line at 2000
+
+# 2) Gap plot with the same treatment-year marker
+gaps.plot(
+  dataprep.res = dp_rescaled,
+  synth.res    = synth_rescaled,
+  Ylab         = "Gap in rescaled emissions",
+  Xlab         = "Year"
+)
+abline(v = 2000, lty = 2, col = "red", lwd = 2)   # dashed red line at 2000
+```
+
+```{r}
+# Extract donor weights and pre-treatment MSPE
+synth_table_rescaled <- synth.tab(dataprep.res = dp_rescaled, synth.res = synth_rescaled)
+
+# Filter weights > 1%
+donor_weights_filtered <- synth_table_rescaled$tab.w %>%
+  as.data.frame() %>%
+  filter(w.weights > 0.01)
+
+# Print filtered donor weights and MSPE
+print("Donor weights > 1%:")
+print(donor_weights_filtered)
+
+print("Pre-treatment MSPE:")
+print(synth_table_rescaled$tab.loss)
+
+```
+
+```{r}
+# Get the gaps (treated - synthetic) from Synth
+gaps <- dp_rescaled$Y1plot - (dp_rescaled$Y0plot %*% synth_rescaled$solution.w)
+
+# Compute pre-treatment MSPE
+pre_treatment_years <- which(dp_rescaled$tag$time.plot %in% pre_years)
+mspe_pre_rescaled <- mean((gaps[pre_treatment_years])^2)
+
+mspe_pre_rescaled
+
+# Create the table for post-treatment years
+gap_table_rescaled <- data.frame(
+  Year = years_post,
+  Gap = round(gaps[dp_rescaled$tag$time.plot %in% years_post], 3)
+)
+
+# View the table
+print(gap_table, row.names = FALSE)
+```
+
+```{r}
+run_in_time_placebo_rescaled <- function(placebo_year) {
+  yrs_pred <- min(pre_years):(placebo_year - 1)
+  
+  dp_pl <- dataprep(
+    foo                   = data,
+    predictors            = NULL,
+    predictors.op         = NULL,
+    special.predictors    = list(
+      list("rescaled1992", yrs_pred, "mean")
+    ),
+    dependent             = "rescaled1992",
+    unit.variable         = "countryid",
+    unit.names.variable   = "country",
+    time.variable         = "year",
+    treatment.identifier  = treated.unit,
+    controls.identifier   = control.units,
+    time.predictors.prior = yrs_pred,
+    time.optimize.ssr     = yrs_pred,
+    time.plot             = plot_years
+  )
+  
+  synth_pl <- synth(dp_pl)
+  
+  path.plot(
+    dataprep.res    = dp_pl,
+    synth.res       = synth_pl,
+    Xlab            = "Year",
+    Ylab            = "Rescaled CO2 emissions index (1992 = 100)",
+    Legend          = c("Estonia", "Synthetic Estonia"),
+    Legend.position = "topright"
+  )
+  abline(v = placebo_year, lty = 2, col = "blue", lwd = 2)
+  abline(v = 2000, lty = 2, col = "red", lwd = 2)
+  title(main = paste("In-Time Placebo at", placebo_year))
+}
+
+# Example: placebo at 1999
+run_in_time_placebo_rescaled(1999)
+
+```
+
+```{r}
+# Step 1: Build gaps for all donors
+all_gaps_rescaled <- purrr::map_df(control.units, function(donor_id) {
+  this_ctrls <- setdiff(control.units, donor_id)
+  
+  dp <- dataprep(
+    foo                   = data,
+    predictors            = NULL,
+    predictors.op         = NULL,
+    special.predictors    = lapply(c(1993, 1994, 1995, 1996, 1997, 1998, 1999), function(y) list("rescaled1992", y, "mean")),
+    dependent             = "rescaled1992",
+    unit.variable         = "countryid",
+    unit.names.variable   = "country",
+    time.variable         = "year",
+    treatment.identifier  = donor_id,
+    controls.identifier   = this_ctrls,
+    time.predictors.prior = pre_years,
+    time.optimize.ssr     = pre_years,
+    time.plot             = plot_years
+  )
+  synth_out <- synth(dp)
+  
+  Y1 <- dp$Y1plot
+  Y0 <- dp$Y0plot %*% synth_out$solution.w
+  gap <- Y1 - Y0
+  mspe <- mean((Y1[dp$tag$time.plot < 2000] - Y0[dp$tag$time.plot < 2000])^2)
+  
+  data.frame(
+    year = plot_years,
+    gap = gap,
+    treated = dp$tag$unit.names[1],
+    mspe = mspe
+  )
+})
+
+# Add Estonia
+Y1_e  <- dp_rescaled$Y1plot
+Y0_e  <- dp_rescaled$Y0plot %*% synth_rescaled$solution.w
+gap_e <- Y1_e - Y0_e
+estonia_mspe <- mean((Y1_e[dp_rescaled$tag$time.plot < 2000] - Y0_e[dp_rescaled$tag$time.plot < 2000])^2)
+
+estonia_gap_df <- data.frame(
+  year = plot_years,
+  gap = gap_e,
+  treated = "Estonia",
+  mspe = estonia_mspe
+)
+
+# Combine all
+all_gaps_df_rescaled <- bind_rows(all_gaps_rescaled, estonia_gap_df)
+
+# Step 2: Filter and plot
+filtered_gaps <- all_gaps_df_rescaled %>%
+  filter(mspe <= 1.5 * estonia_mspe)
+
+ggplot(filtered_gaps, aes(x = year, y = gap, group = treated)) +
+  geom_line(data = filter(filtered_gaps, treated != "Estonia"),
+            color = "grey70", size = 0.4) +
+  geom_line(data = filter(filtered_gaps, treated == "Estonia"),
+            color = "black", size = 1.2) +
+  geom_vline(xintercept = 2000, linetype = "dashed") +
+  coord_cartesian(ylim = c(-3, 8)) +
+  theme_minimal(base_size = 14) +
+  labs(
+    x = "Year",
+    y = "Gap in rescaled CO2 emissions index"
+  )
+
+```
